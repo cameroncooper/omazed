@@ -114,6 +114,7 @@ check_omarchy_hook_support() {
 }
 
 setup_omarchy_hook() {
+    local enable_font_sync="${1:-false}"
 
     local hook_marker_start="# >>> omazed hook - do not edit >>>"
     local hook_marker_end="# <<< omazed hook - do not edit <<<"
@@ -133,6 +134,19 @@ omazed set "$1"
 EOF
         chmod +x "$v4_hook_file"
         info "Created v4 omarchy hook: $v4_hook_file"
+
+        if [[ "$enable_font_sync" == "true" ]]; then
+            local font_hook_dir="$OMARCHY_HOOKS_DIR/font-set.d"
+            mkdir -p "$font_hook_dir"
+            local v4_font_hook_file="$font_hook_dir/omazed"
+
+            cat > "$v4_font_hook_file" << 'EOF'
+#!/bin/bash
+omazed set-font "$1"
+EOF
+            chmod +x "$v4_font_hook_file"
+            info "Created v4 omarchy font hook: $v4_font_hook_file"
+        fi
 
         # Cleanup old v3 hook if it exists
         if [[ -f "$THEME_SET_HOOK" ]] && grep -q "$hook_marker_start" "$THEME_SET_HOOK" 2>/dev/null; then
@@ -169,19 +183,20 @@ EOF
 }
 
 setup_user() {
+    local enable_font_sync="${1:-false}"
     info "Setting up Omazed for user: $USER"
     echo ""
 
     mkdir -p "$ZED_THEMES_DIR"
 
     if check_omarchy_hook_support; then
-        setup_omarchy_hook
+        setup_omarchy_hook "$enable_font_sync"
     else
         error "Omarchy hook system not available. Please update omarchy or install a older version of omazed < 1.2"
         return 1
     fi
 
-    sync_theme
+    sync_all
 
     echo ""
     success "Setup complete!"
@@ -189,6 +204,216 @@ setup_user() {
     success "🎉 Omazed is ready!"
     info "Change your Omarchy theme and watch Zed follow along automatically!"
     return 0
+}
+
+get_current_font() {
+    local font=""
+
+    if command -v omarchy >/dev/null 2>&1; then
+        font=$(omarchy font current 2>/dev/null || true)
+    fi
+
+    if [[ -z "$font" ]] && command -v fc-match >/dev/null 2>&1; then
+        font=$(fc-match monospace -f '%{family}\n' 2>/dev/null | head -n1 | cut -d, -f1)
+    fi
+
+    printf '%s\n' "$font"
+}
+
+points_to_zed_pixels() {
+    local points="$1"
+    awk -v points="$points" 'BEGIN { printf "%.2f\n", points * 96 / 72 }'
+}
+
+get_default_terminal() {
+    if command -v omarchy >/dev/null 2>&1; then
+        omarchy default terminal 2>/dev/null || true
+    fi
+}
+
+get_current_terminal_font_size_px() {
+    local terminal
+    terminal=$(get_default_terminal)
+
+    local config_file=""
+    local size=""
+
+    case "$terminal" in
+        foot)
+            config_file="${XDG_CONFIG_HOME:-$HOME/.config}/foot/foot.ini"
+            [[ -f "$config_file" ]] || return 1
+
+            if grep -qiE '^[[:space:]]*dpi-aware[[:space:]]*=[[:space:]]*yes([[:space:]#;]|$)' "$config_file"; then
+                warn "Foot dpi-aware=yes varies by monitor, so no single Zed font size can match it" >&2
+                return 1
+            fi
+
+            size=$(grep -oP '^[[:space:]]*font=.*:pixelsize=\K[0-9.]+' "$config_file" | tail -n1 || true)
+            if [[ -n "$size" ]]; then
+                printf '%.2f\n' "$size"
+                return 0
+            fi
+
+            size=$(grep -oP '^[[:space:]]*font=.*:size=\K[0-9.]+' "$config_file" | tail -n1 || true)
+            ;;
+        alacritty)
+            config_file="${XDG_CONFIG_HOME:-$HOME/.config}/alacritty/alacritty.toml"
+            [[ -f "$config_file" ]] || return 1
+            size=$(grep -oP '^[[:space:]]*size[[:space:]]*=[[:space:]]*\K[0-9.]+' "$config_file" | head -n1 || true)
+            ;;
+        kitty)
+            config_file="${XDG_CONFIG_HOME:-$HOME/.config}/kitty/kitty.conf"
+            [[ -f "$config_file" ]] || return 1
+            size=$(grep -oP '^[[:space:]]*font_size[[:space:]]+\K[0-9.]+' "$config_file" | head -n1 || true)
+            ;;
+        ghostty)
+            config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ghostty/config"
+            [[ -f "$config_file" ]] || return 1
+            size=$(grep -oP '^[[:space:]]*font-size[[:space:]]*=[[:space:]]*\K[0-9.]+' "$config_file" | head -n1 || true)
+            ;;
+        *)
+            warn "Cannot sync font size for unsupported default terminal: ${terminal:-unknown}" >&2
+            return 1
+            ;;
+    esac
+
+    if [[ ! "$size" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v size="$size" 'BEGIN { exit !(size > 0) }'; then
+        warn "Could not determine $terminal font size from $config_file" >&2
+        return 1
+    fi
+
+    # Terminal font sizes are in points; Zed font sizes are logical pixels.
+    points_to_zed_pixels "$size"
+}
+
+set_zed_setting() {
+    local key="$1"
+    local value="$2"
+    mkdir -p "$ZED_CONFIG_DIR"
+
+    if [[ ! -f "$ZED_SETTINGS_PATH" ]]; then
+        printf '{\n  "%s": %s\n}\n' "$key" "$value" > "$ZED_SETTINGS_PATH"
+        return 0
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    if grep -qE "^[[:space:]]*\"${key}\"[[:space:]]*:" "$ZED_SETTINGS_PATH"; then
+        awk -v key="$key" -v value="$value" '
+        $0 ~ "^[[:space:]]*\"" key "\"[[:space:]]*:" {
+            indent = $0
+            sub(/[^[:space:]].*$/, "", indent)
+            line = $0
+            comment = ""
+            if (match(line, /[[:space:]]*\/\/.*/)) {
+                comment = substr(line, RSTART)
+                line = substr(line, 1, RSTART - 1)
+            }
+            comma = (line ~ /,[[:space:]]*$/) ? "," : ""
+            print indent "\"" key "\": " value comma comment
+            next
+        }
+        { print }
+        ' "$ZED_SETTINGS_PATH" > "$temp_file"
+    else
+        awk -v key="$key" -v value="$value" '
+        { lines[NR] = $0 }
+        END {
+            close_index = 0
+            for (i = NR; i >= 1; i--) {
+                if (lines[i] ~ /^[[:space:]]*}[[:space:]]*$/) {
+                    close_index = i
+                    break
+                }
+            }
+
+            if (close_index == 0) {
+                print "{"
+                print "  \"" key "\": " value
+                print "}"
+                exit
+            }
+
+            prev = close_index - 1
+            while (prev > 0 && lines[prev] ~ /^[[:space:]]*$/) prev--
+            if (prev > 0 && lines[prev] !~ /,[[:space:]]*$/ && lines[prev] !~ /{[[:space:]]*$/) {
+                lines[prev] = lines[prev] ","
+            }
+
+            for (i = 1; i < close_index; i++) print lines[i]
+            print "  \"" key "\": " value
+            print lines[close_index]
+            for (i = close_index + 1; i <= NR; i++) print lines[i]
+        }
+        ' "$ZED_SETTINGS_PATH" > "$temp_file"
+    fi
+
+    mv "$temp_file" "$ZED_SETTINGS_PATH"
+}
+
+set_zed_font() {
+    local font_name="$1"
+
+    if [[ -z "$font_name" ]]; then
+        error "No font name provided"
+        return 1
+    fi
+
+    if [[ "$font_name" == *'"'* || "$font_name" == *'\\'* ]]; then
+        error "Unsupported character in font name: $font_name"
+        return 1
+    fi
+
+    set_zed_setting "buffer_font_family" "\"$font_name\""
+    success "Zed editor and terminal font set to: $font_name"
+}
+
+set_zed_font_size() {
+    local font_size="$1"
+
+    if [[ ! "$font_size" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v size="$font_size" 'BEGIN { exit !(size > 0) }'; then
+        error "Invalid Zed font size: $font_size"
+        return 1
+    fi
+
+    set_zed_setting "buffer_font_size" "$font_size"
+    success "Zed editor and terminal font size set to: $font_size px"
+}
+
+sync_font() {
+    local current_font="${1:-}"
+    if [[ -z "$current_font" ]]; then
+        current_font=$(get_current_font)
+    fi
+
+    if [[ -z "$current_font" ]]; then
+        warn "Could not determine current Omarchy font"
+        return 1
+    fi
+
+    set_zed_font "$current_font"
+
+    local current_size
+    if ! current_size=$(get_current_terminal_font_size_px); then
+        warn "Zed font family was updated, but terminal font size could not be synced"
+        return 1
+    fi
+
+    set_zed_font_size "$current_size"
+}
+
+font_sync_enabled() {
+    [[ -x "$OMARCHY_HOOKS_DIR/font-set.d/omazed" ]]
+}
+
+sync_all() {
+    local result=0
+    sync_theme || result=1
+    if font_sync_enabled; then
+        sync_font || result=1
+    fi
+    return "$result"
 }
 
 get_current_theme() {
@@ -425,8 +650,10 @@ COMMANDS:
     setup       Set up themes and automatic theme sync hook
     sync        Sync theme once and exit
     set         Set theme by name (used by omarchy hooks)
+    set-font    Set font by name (used by omarchy hooks)
 
 OPTIONS:
+    --sync-font Enable font syncing during setup
     -h, --help  Show this help
 
 EXAMPLES:
@@ -439,6 +666,7 @@ EOF
 main() {
     local command=""
     local theme_arg=""
+    local enable_font_sync="false"
 
     if [[ $# -eq 0 ]]; then
         usage
@@ -457,8 +685,18 @@ main() {
                 theme_arg="$1"
                 shift
                 ;;
+            set-font)
+                command="set-font"
+                shift
+                theme_arg="${1:-}"
+                [[ $# -gt 0 ]] && shift
+                ;;
             setup)
                 command="setup"
+                shift
+                ;;
+            --sync-font)
+                enable_font_sync="true"
                 shift
                 ;;
             -h|--help)
@@ -477,7 +715,7 @@ main() {
 
     case $command in
         sync)
-            sync_theme
+            sync_all
             ;;
 
         set)
@@ -488,8 +726,16 @@ main() {
             fi
             set_theme_from_name "$theme_arg"
             ;;
+        set-font)
+            if [[ -z "$theme_arg" ]]; then
+                error "Font name required for 'set-font' command"
+                error "Usage: omazed set-font \"font-name\""
+                exit 1
+            fi
+            sync_font "$theme_arg"
+            ;;
         setup)
-            setup_user
+            setup_user "$enable_font_sync"
             ;;
     esac
 }

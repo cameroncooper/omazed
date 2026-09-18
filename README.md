@@ -43,6 +43,9 @@ cd omazed
 # Set up hooks and sync once
 omazed setup
 
+# Optionally include font syncing
+omazed setup --sync-font
+
 # Regenerate theme for the current Omarchy palette
 omazed sync
 

@@ -17,6 +17,7 @@ BIN_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/omazed"
 OMARCHY_HOOKS_DIR="$HOME/.config/omarchy/hooks"
 THEME_SET_HOOK="$OMARCHY_HOOKS_DIR/theme-set"
+FONT_SET_D_HOOK="$OMARCHY_HOOKS_DIR/font-set.d/omazed"
 SYNC_SCRIPT="$BIN_DIR/omazed"
 GENERATOR_SCRIPT="$BIN_DIR/omazed-generator.sh"
 TEMPLATE_FILE="$BIN_DIR/omazed-theme.tpl"
@@ -136,6 +137,7 @@ remove_omarchy_hook() {
 
     local hook_marker_start="# >>> omazed hook - do not edit >>>"
     local hook_marker_end="# <<< omazed hook - do not edit <<<"
+    rm -f "$FONT_SET_D_HOOK"
 
     if [[ -f "$THEME_SET_HOOK" ]]; then
         if grep -q "$hook_marker_start" "$THEME_SET_HOOK" 2>/dev/null; then
